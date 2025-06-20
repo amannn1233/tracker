@@ -67,8 +67,8 @@ def monitor_loop():
     For each transaction, if a parsed SPL token "transfer" instruction is detected
     where the destination matches the monitored token account and the transfer amount,
     when normalized (using 6 decimals), is ≥ THRESHOLD_TOKEN, then the timer is reset
-    and the block timestamp is recorded. If no qualifying inflow occurs within PAUSE_THRESHOLD
-    seconds, an alert is sent.
+    and the block timestamp is recorded.
+    If no qualifying inflow occurs within PAUSE_THRESHOLD seconds, an alert is sent.
     """
     global last_big_inflow_time, processed_signatures, alert_sent, monitoring_active
     global alert_chat_id, application, bot_loop, token_account, last_inflow_timestamp
@@ -102,7 +102,7 @@ def monitor_loop():
                     # For inflow, the destination must match the monitored token account.
                     if info.get("destination") != token_account:
                         continue
-                    # First, try to get the human-readable uiAmount.
+                    # First, try to get the human‑readable uiAmount.
                     token_amount = info.get("uiAmount")
                     if token_amount is None:
                         try:
@@ -115,7 +115,7 @@ def monitor_loop():
                         print(f"[{datetime.utcnow().isoformat()}] Big inflow detected: {token_amount} tokens, tx: {sig}")
                         last_big_inflow_time = time.monotonic()
                         alert_sent = False
-                        # Capture block time: if available, convert it to a human‑readable format.
+                        # Capture block time (if available) as a human‑readable timestamp.
                         if block_time:
                             last_inflow_timestamp = datetime.fromtimestamp(block_time).strftime("%Y-%m-%d %H:%M:%S")
                         else:
@@ -175,7 +175,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ------------------ MAIN FUNCTION (Updated as Provided) ------------------
+# ------------------ MAIN FUNCTION ------------------
 def main():
     global application
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -190,10 +190,16 @@ def main():
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("stop", stop_command))
     
-    print("Telegram bot started. Use /start to begin and /stop to stop monitoring.")
+    print("Telegram bot started. Use /start to begin and /stop to stop monitoring.", flush=True)
     
-    # Delete any existing webhook before starting polling to avoid conflicts.
-    application.bot.delete_webhook(drop_pending_updates=True)
+    # Use (or create) the current event loop without closing it so that run_polling() can use it.
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    loop.run_until_complete(application.bot.delete_webhook(drop_pending_updates=True))
     
     application.run_polling()
 
