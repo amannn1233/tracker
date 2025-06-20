@@ -69,7 +69,8 @@ def make_request(method, params):
 def monitor_loop():
     """
     Debug mode: Fetch the last 10 transactions from SELECTED_WALLET and print
-    each transaction's signature and its SOL amount for every System transfer.
+    each transaction's signature and its SOL amount for every system transfer,
+    including both outflow (sent) and inflow (received) events.
     """
     while monitoring_active and SELECTED_WALLET:
         res = make_request("getSignaturesForAddress", [SELECTED_WALLET, {"limit": TRANSACTION_LIMIT}])
@@ -84,10 +85,16 @@ def monitor_loop():
                 for instr in instructions:
                     if instr.get("program") == "system" and instr.get("parsed", {}).get("type") == "transfer":
                         info = instr["parsed"]["info"]
+                        # Outflow: wallet is the source.
                         if info.get("source") == SELECTED_WALLET:
                             lam = float(info.get("lamports", 0))
                             sol = lam / 1e9
                             print(f"[{datetime.utcnow().isoformat()}] TX: {sig} sent {sol:.4f} SOL")
+                        # Inflow: wallet is the destination.
+                        elif info.get("destination") == SELECTED_WALLET:
+                            lam = float(info.get("lamports", 0))
+                            sol = lam / 1e9
+                            print(f"[{datetime.utcnow().isoformat()}] TX: {sig} received {sol:.4f} SOL")
             processed_signatures.add(sig)
         time.sleep(POLL_INTERVAL)
 
