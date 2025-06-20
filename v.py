@@ -6,17 +6,22 @@ import requests
 import json
 from datetime import datetime
 
+# FastAPI & Uvicorn for uptime endpoint
 from fastapi import FastAPI
 import uvicorn
 
-from telegram import Update
-from telegram.error import Conflict as TGConflict
+# Telegram imports
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ConversationHandler,
-    MessageHandler, ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
 
-# ─── FASTAPI UPTIME ─────────────────────────────────────────
+# ------------------ FASTAPI (UPTIME) SETUP ------------------
 fast_app = FastAPI()
 
 @fast_app.get("/")
@@ -27,177 +32,155 @@ def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(fast_app, host="0.0.0.0", port=port)
 
-# ─── CONFIG ─────────────────────────────────────────────────
-RPC_URL            = "https://api.mainnet-beta.solana.com"
-SOL_THRESHOLD      = 0.5
-PAUSE_THRESHOLD    = 40
-POLL_INTERVAL      = 5
-MAX_PAGES          = 40      # 40 × 25 = 1000 txs
-PAGE_LIMIT         = 25
+# ------------------ CONFIGURATION ------------------
+RPC_URL             = "https://api.mainnet-beta.solana.com"
+POSSIBLE_WALLETS    = [
+    "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa",
+    "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4"
+]
+THRESHOLD_SOL       = 0.5
+PAUSE_THRESHOLD     = 40
+POLL_INTERVAL       = 5
+TRANSACTION_LIMIT   = 100
+TELEGRAM_BOT_TOKEN  = "7545022673:AAHUSh--IN95PVDATCeu6a0bHYd6ymuet_Y"
 
-TELEGRAM_BOT_TOKEN = "8057780965:AAFyjn9qRdax2kOiZzBZae6VkB1bbBppiIg"
+# ------------------ GLOBAL STATE ------------------
+monitoring_active     = False
+monitor_thread        = None
+SELECTED_WALLET       = None
+last_big_outflow_time = time.monotonic()
+processed_signatures  = set()
+alert_sent            = False
+alert_chat_id         = None
+application           = None
+bot_loop              = None
 
-# ─── GLOBAL STATE ───────────────────────────────────────────
-vault_address        = None
-monitoring_active    = False
-monitor_thread       = None
-last_inflow_time     = time.monotonic()
-processed_signatures = set()
-alert_sent           = False
-alert_chat_id        = None
-application          = None
-bot_loop             = None
-
-VAULT_ADDRESS = 1  # conversation step
-
-# ─── JSON-RPC HELPER ───────────────────────────────────────
+# ------------------ RPC HELPER ------------------
 def make_request(method, params):
+    payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
     try:
-        r = requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=10)
+        r = requests.post(RPC_URL, json=payload, timeout=10)
         return r.json()
     except Exception as e:
         print("RPC error:", e)
         return {}
 
-# ─── MONITORING LOOP ───────────────────────────────────────
+# ------------------ MONITOR LOOP ------------------
 def monitor_loop():
-    global last_inflow_time, processed_signatures, alert_sent
-    global monitoring_active, alert_chat_id, application, bot_loop, vault_address
+    global last_big_outflow_time, processed_signatures, alert_sent
 
-    while monitoring_active:
-        if not vault_address:
-            time.sleep(POLL_INTERVAL)
-            continue
-
-        sigs, before, page = [], None, 0
-        while page < MAX_PAGES:
-            res = make_request("getSignaturesForAddress", [
-                vault_address,
-                {"limit": PAGE_LIMIT, **({"before": before} if before else {})}
-            ])
-            results = res.get("result", [])
-            if not results:
-                break
-            sigs += results
-            before = results[-1]["signature"]
-            page += 1
-
-        for entry in sigs:
+    while monitoring_active and SELECTED_WALLET:
+        res = make_request("getSignaturesForAddress", [SELECTED_WALLET, {"limit": TRANSACTION_LIMIT}])
+        for entry in res.get("result", []):
             sig = entry["signature"]
             if sig in processed_signatures:
                 continue
 
-            tx = make_request("getParsedTransaction", [sig, {"encoding":"jsonParsed"}]).get("result")
-            if not tx:
-                processed_signatures.add(sig)
-                continue
-
-            instrs = tx.get("transaction", {}).get("message", {}).get("instructions", [])
-            for instr in instrs:
-                if instr.get("program") == "system" and "parsed" in instr:
-                    parsed = instr["parsed"]
-                    if parsed.get("type") == "transfer":
-                        info = parsed.get("info", {})
-                        if info.get("destination") == vault_address:
-                            lam = info.get("lamports", 0)
-                            sol = lam / 1e9
-                            print(f"[{datetime.utcnow().isoformat()}] Detected SOL to vault: {sol} SOL tx:{sig}")
-                            if sol >= SOL_THRESHOLD:
-                                print(f"✅ Big inflow: {sol} SOL")
-                                last_inflow_time = time.monotonic()
+            tx = make_request("getParsedTransaction", [sig, {"encoding": "jsonParsed"}]).get("result")
+            if tx:
+                instructions = tx["transaction"]["message"]["instructions"]
+                for instr in instructions:
+                    if instr.get("program")=="system" and instr.get("parsed",{}).get("type")=="transfer":
+                        info = instr["parsed"]["info"]
+                        if info.get("source")==SELECTED_WALLET:
+                            lam = float(info.get("lamports",0))
+                            sol = lam/1e9
+                            if sol >= THRESHOLD_SOL:
+                                print(f"[{datetime.utcnow().isoformat()}] {sol} SOL sent (tx {sig})")
+                                last_big_outflow_time = time.monotonic()
                                 alert_sent = False
 
             processed_signatures.add(sig)
 
-        now = time.monotonic()
-        if now - last_inflow_time >= PAUSE_THRESHOLD and not alert_sent:
-            text = (f"🚨 ALERT: No SOL inflow ≥ {SOL_THRESHOLD} to {vault_address} "
-                    f"for {int(now-last_inflow_time)}s")
+        elapsed = time.monotonic() - last_big_outflow_time
+        if elapsed >= PAUSE_THRESHOLD and not alert_sent:
+            text = (f"🚨 No ≥{THRESHOLD_SOL} SOL outflow from {SELECTED_WALLET} "
+                    f"in {int(elapsed)} seconds.")
             if alert_chat_id and bot_loop:
                 fut = asyncio.run_coroutine_threadsafe(
                     application.bot.send_message(chat_id=alert_chat_id, text=text),
                     bot_loop
                 )
-                try: fut.result()
-                except Exception as e: print("Alert error:", e)
+                try:
+                    fut.result()
+                except:
+                    pass
             print(text)
             alert_sent = True
 
         time.sleep(POLL_INTERVAL)
 
-# ─── TELEGRAM COMMANDS ──────────────────────────────────────
-async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Send the pool's SOL-vault address to monitor (we'll track inflows ≥ 0.5 SOL):"
-    )
-    return VAULT_ADDRESS
+# ------------------ BOT HANDLERS ------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton(POSSIBLE_WALLETS[0], callback_data=POSSIBLE_WALLETS[0]),
+            InlineKeyboardButton(POSSIBLE_WALLETS[1], callback_data=POSSIBLE_WALLETS[1]),
+        ]
+    ]
+    reply = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select wallet to monitor:", reply_markup=reply)
 
-async def set_vault_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    global vault_address, monitoring_active, monitor_thread
-    global last_inflow_time, processed_signatures, alert_chat_id, alert_sent, bot_loop
+async def wallet_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global SELECTED_WALLET, monitoring_active, monitor_thread
+    global last_big_outflow_time, processed_signatures, alert_sent
+    global alert_chat_id, bot_loop
 
-    vault_address = update.message.text.strip()
-    alert_chat_id = update.effective_chat.id
-    bot_loop      = asyncio.get_running_loop()
+    query = update.callback_query
+    await query.answer()
 
-    await update.message.reply_text(
-        f"✅ Monitoring SOL inflows to vault:\n{vault_address}\n\n"
-        f"Threshold: {SOL_THRESHOLD} SOL"
-    )
+    SELECTED_WALLET = query.data
+    alert_chat_id   = query.message.chat.id
+    bot_loop        = asyncio.get_running_loop()
 
-    monitoring_active = True
-    last_inflow_time  = time.monotonic()
-    processed_signatures.clear()
-    alert_sent = False
+    monitoring_active     = True
+    last_big_outflow_time = time.monotonic()
+    processed_signatures  = set()
+    alert_sent            = False
 
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
-    return ConversationHandler.END
+    await query.edit_message_text(f"🟢 Now monitoring wallet:\n{SELECTED_WALLET}")
 
-async def stop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not monitor_thread or not monitor_thread.is_alive():
+        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        monitor_thread.start()
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_active
     monitoring_active = False
     await update.message.reply_text("🛑 Monitoring stopped.")
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
-
-# ─── MAIN ──────────────────────────────────────────────────
+# ------------------ MAIN ------------------
 def main():
     global application
 
+    # Start FastAPI uptime endpoint
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start_command)],
-        states={ VAULT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_vault_address)] },
-        fallbacks=[CommandHandler("cancel", cancel)]
+    # Build the Telegram bot
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
     )
-    application.add_handler(conv)
-    application.add_handler(CommandHandler("stop", stop_command))
 
-    print("✅ Bot ready. Use /start to set vault.", flush=True)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(wallet_selected))
+    application.add_handler(CommandHandler("stop", stop))
 
+    print("Bot is live. Use /start to pick a wallet, /stop to end.", flush=True)
+
+    # Ensure any existing webhook/getUpdates is cleared
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
     loop.run_until_complete(
         application.bot.delete_webhook(drop_pending_updates=True)
     )
 
-    try:
-        application.run_polling(drop_pending_updates=True)
-    except TGConflict:
-        print("🔁 Conflict detected—clearing updates and retrying polling.")
-        loop.run_until_complete(
-            application.bot.delete_webhook(drop_pending_updates=True)
-        )
-        application.run_polling(drop_pending_updates=True)
+    # Start polling
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
