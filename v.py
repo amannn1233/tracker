@@ -6,17 +6,18 @@ import requests
 import json
 from datetime import datetime
 
-# FastAPI and Uvicorn imports for uptime endpoint
+# FastAPI & Uvicorn for uptime endpoint
 from fastapi import FastAPI
 import uvicorn
 
+# Telegram imports
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
 )
 
-# ------------------ FASTAPI (UPTIME) SETUP ------------------
+# ─── FASTAPI UPTIME ───────────────────────────────────────────
 fast_app = FastAPI()
 
 @fast_app.get("/")
@@ -27,180 +28,125 @@ def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(fast_app, host="0.0.0.0", port=port)
 
-# ------------------ BOT CONFIGURATION ------------------
+# ─── CONFIGURATION ────────────────────────────────────────────
 RPC_URL            = "https://api.mainnet-beta.solana.com"
-# The token account will be provided by the user interactively.
-token_account      = None
+SOL_THRESHOLD      = 0.5     # 0.5 SOL threshold
+PAUSE_THRESHOLD    = 40      # seconds without inflow = alert
+POLL_INTERVAL      = 5       # seconds between checks
 
-# Thresholds
-THRESHOLD_TOKEN    = 0.5    # SPL token units
-SOL_THRESHOLD      = 0.5    # SOL units
-PAUSE_THRESHOLD    = 40     # seconds without big inflow = alert
-POLL_INTERVAL      = 5      # seconds between polls
-
-# Telegram bot token
 TELEGRAM_BOT_TOKEN = "8057780965:AAFyjn9qRdax2kOiZzBZae6VkB1bbBppiIg"
 
-# ------------------ GLOBAL VARIABLES ------------------
-monitoring_active     = False
-monitor_thread        = None
-last_big_inflow_time  = time.monotonic()
-processed_signatures  = set()
-alert_sent            = False
-alert_chat_id         = None
-application           = None
-bot_loop              = None
+# ─── STATE ─────────────────────────────────────────────────────
+vault_address       = None    # the SOL-vault (pool) address you’ll paste
+monitoring_active   = False
+monitor_thread      = None
+last_inflow_time    = time.monotonic()
+processed_signatures= set()
+alert_sent          = False
+alert_chat_id       = None
+application         = None
+bot_loop            = None
 
-# Conversation state for receiving a token address
-TOKEN_ADDRESS = 1
+# conversation state
+VAULT_ADDRESS = 1
 
-# ------------------ UTILITY FUNCTIONS ------------------
+# ─── JSON-RPC HELPER ───────────────────────────────────────────
 def make_request(method, params):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    }
-    headers = {"Content-Type": "application/json"}
+    payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
     try:
-        response = requests.post(RPC_URL, data=json.dumps(payload, default=str), headers=headers)
-        return response.json()
+        r = requests.post(RPC_URL, json=payload, timeout=10)
+        return r.json()
     except Exception as e:
-        print("Error in make_request:", e)
+        print("RPC error:", e)
         return {}
 
+# ─── MONITORING LOOP ───────────────────────────────────────────
 def monitor_loop():
-    """
-    Polls `token_account` for new SPL‐token or SOL transfer inflows.
-    Alerts if no inflow ≥ threshold within PAUSE_THRESHOLD seconds.
-    """
-    global last_big_inflow_time, processed_signatures, alert_sent
-    global monitoring_active, alert_chat_id, application, bot_loop, token_account
+    global last_inflow_time, processed_signatures, alert_sent
+    global monitoring_active, alert_chat_id, application, bot_loop, vault_address
 
     while monitoring_active:
-        if token_account is None:
+        if not vault_address:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # 1) fetch recent signatures
-        res = make_request("getSignaturesForAddress", [token_account, {"limit": 5}])
-        entries = res.get("result", [])
+        # fetch recent signatures for the vault address
+        res = make_request("getSignaturesForAddress", [vault_address, {"limit": 10}])
+        sigs = res.get("result", [])
 
-        for entry in entries:
+        for entry in sigs:
             sig = entry.get("signature")
             if sig in processed_signatures:
                 continue
 
-            # 2) fetch parsed transaction
-            tx_res = make_request("getParsedTransaction", [sig, {"encoding": "jsonParsed"}])
-            tx = tx_res.get("result")
+            # fetch parsed transaction
+            tx = make_request("getParsedTransaction", [sig, {"encoding":"jsonParsed"}]).get("result")
             if not tx:
                 processed_signatures.add(sig)
                 continue
 
-            block_time = tx.get("blockTime")
-            instrs     = tx.get("transaction", {}).get("message", {}).get("instructions", [])
-
+            instrs = tx.get("transaction", {}).get("message", {}).get("instructions", [])
             for instr in instrs:
-                # ───── SPL‐TOKEN branch (unchanged) ─────────────────
-                if instr.get("program") == "spl-token" and "parsed" in instr:
-                    parsed = instr["parsed"]
-                    if parsed.get("type") != "transfer":
-                        continue
-                    info = parsed.get("info", {})
-                    if info.get("destination") != token_account:
-                        continue
-
-                    # parse raw amount + decimals
-                    token_amount = None
-                    ta = info.get("tokenAmount", {})
-                    if isinstance(ta, dict) and "amount" in ta and "decimals" in ta:
-                        try:
-                            raw = float(ta["amount"])
-                            dec = int(ta["decimals"])
-                            token_amount = raw / (10 ** dec)
-                        except:
-                            continue
-                    else:
-                        try:
-                            token_amount = float(info.get("amount", "0"))
-                        except:
-                            continue
-
-                    if token_amount is not None and token_amount >= THRESHOLD_TOKEN:
-                        print(f"[{datetime.utcnow().isoformat()}] "
-                              f"SPL inflow detected: {token_amount} tokens, tx: {sig}")
-                        last_big_inflow_time = time.monotonic()
-                        alert_sent = False
-
-                # ───── SOL branch (new) ─────────────────────────────
-                elif instr.get("program") == "system" and "parsed" in instr:
+                # only System Program "transfer" instructions
+                if instr.get("program") == "system" and "parsed" in instr:
                     parsed = instr["parsed"]
                     if parsed.get("type") == "transfer":
                         info = parsed.get("info", {})
-                        # check destination
-                        if info.get("destination") == token_account:
-                            lamports = info.get("lamports", 0)
-                            sol = lamports / 1e9
+                        # incoming SOL to the vault
+                        if info.get("destination") == vault_address:
+                            lam = info.get("lamports", 0)
+                            sol = lam / 1e9
                             if sol >= SOL_THRESHOLD:
                                 print(f"[{datetime.utcnow().isoformat()}] "
                                       f"SOL inflow detected: {sol} SOL, tx: {sig}")
-                                last_big_inflow_time = time.monotonic()
+                                last_inflow_time = time.monotonic()
                                 alert_sent = False
 
             processed_signatures.add(sig)
 
-        # 3) pause alert
+        # pause alert if no large inflow in PAUSE_THRESHOLD
         now = time.monotonic()
-        if now - last_big_inflow_time >= PAUSE_THRESHOLD and not alert_sent:
-            message_text = (
-                f"🚨 ALERT: No inflow ≥ thresholds (SPL≥{THRESHOLD_TOKEN} or SOL≥{SOL_THRESHOLD}) "
-                f"for {int(now - last_big_inflow_time)} seconds"
-            )
+        if now - last_inflow_time >= PAUSE_THRESHOLD and not alert_sent:
+            text = (f"🚨 ALERT: No SOL inflow ≥ {SOL_THRESHOLD} SOL to {vault_address} "
+                    f"for {int(now-last_inflow_time)}s")
             if alert_chat_id and bot_loop:
                 fut = asyncio.run_coroutine_threadsafe(
-                    application.bot.send_message(chat_id=alert_chat_id, text=message_text),
+                    application.bot.send_message(chat_id=alert_chat_id, text=text),
                     bot_loop
                 )
-                try:
-                    fut.result()
-                except Exception as exc:
-                    print("Error sending alert:", exc)
-            print(message_text)
+                try: fut.result()
+                except Exception as e: print("Alert send error:", e)
+            print(text)
             alert_sent = True
 
         time.sleep(POLL_INTERVAL)
 
-# ------------------ TELEGRAM BOT HANDLERS ------------------
+# ─── TELEGRAM HANDLERS ─────────────────────────────────────────
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "Please enter the SPL token account address you want to monitor:"
+        "Send me the SOL-vault address (the pool account) you want to monitor for ≥0.5 SOL buys:"
     )
-    return TOKEN_ADDRESS
+    return VAULT_ADDRESS
 
-async def set_token_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    global token_account, monitoring_active, monitor_thread
-    global last_big_inflow_time, processed_signatures, alert_chat_id, alert_sent, bot_loop
+async def set_vault_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    global vault_address, monitoring_active, monitor_thread
+    global last_inflow_time, processed_signatures, alert_chat_id, alert_sent, bot_loop
 
-    token_account = update.message.text.strip()
-    if not token_account:
-        await update.message.reply_text("Invalid token address. Please try /start again.")
-        return ConversationHandler.END
-
+    vault_address = update.message.text.strip()
     alert_chat_id = update.effective_chat.id
     bot_loop      = asyncio.get_running_loop()
 
-    await update.message.reply_text(f"Monitoring started for:\n{token_account}")
-    monitoring_active    = True
-    last_big_inflow_time = time.monotonic()
-    processed_signatures = set()
-    alert_sent           = False
+    await update.message.reply_text(
+        f"Monitoring SOL inflows ≥{SOL_THRESHOLD} SOL to:\n{vault_address}"
+    )
 
-    if monitor_thread is None or not monitor_thread.is_alive():
-        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-        monitor_thread.start()
+    monitoring_active   = True
+    last_inflow_time    = time.monotonic()
+    processed_signatures= set()
+    alert_sent          = False
 
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
     return ConversationHandler.END
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,26 +158,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ------------------ MAIN FUNCTION ------------------
+# ─── MAIN ENTRYPOINT ────────────────────────────────────────────
 def main():
     global application
 
-    # Start the FastAPI web server for uptime checks
-    web_thread = threading.Thread(target=run_web_server, daemon=True)
-    web_thread.start()
+    # start FastAPI uptime endpoint
+    threading.Thread(target=run_web_server, daemon=True).start()
 
-    # Build and run the Telegram bot
+    # build and start the Telegram bot
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
-        states={ TOKEN_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_token_address)] },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        states={ VAULT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_vault_address)] },
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
-    application.add_handler(conv_handler)
+    application.add_handler(conv)
     application.add_handler(CommandHandler("stop", stop_command))
 
-    print("Telegram bot started. Use /start to begin and /stop to stop monitoring.")
+    print("Bot is live. Use /start to set the SOL-vault address.", flush=True)
     application.run_polling()
 
 if __name__ == "__main__":
