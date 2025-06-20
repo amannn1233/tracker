@@ -37,7 +37,8 @@ POSSIBLE_WALLETS    = [
     "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa",
     "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4"
 ]
-THRESHOLD_SOL       = 0.5
+THRESHOLD_SOL       = 0.05
+
 PAUSE_THRESHOLD     = 40
 POLL_INTERVAL       = 5
 TRANSACTION_LIMIT   = 1000   # Fetch last 1000 transactions
