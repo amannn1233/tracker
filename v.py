@@ -37,7 +37,10 @@ def run_web_server():
 # ------------------ CONFIGURATION ------------------
 RPC_HTTP_URL        = os.getenv("RPC_HTTP_URL", "https://api.mainnet-beta.solana.com")
 RPC_WS_URL          = os.getenv("RPC_WS_URL", "wss://api.mainnet-beta.solana.com")
-POSSIBLE_WALLETS    = json.loads(os.getenv("POSSIBLE_WALLETS_JSON", "[]"))  # e.g. '["wallet1","wallet2"]'
+POSSIBLE_WALLETS    = [
+    "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4",
+    "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa"
+]
 THRESHOLD_SOL       = float(os.getenv("THRESHOLD_SOL", "0.5"))
 PAUSE_THRESHOLD     = int(os.getenv("PAUSE_THRESHOLD", "40"))
 POLL_INTERVAL       = float(os.getenv("POLL_INTERVAL", "1"))  # seconds for fallback polling
