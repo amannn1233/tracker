@@ -37,15 +37,15 @@ POLL_INTERVAL      = 5       # seconds between checks
 TELEGRAM_BOT_TOKEN = "8057780965:AAFyjn9qRdax2kOiZzBZae6VkB1bbBppiIg"
 
 # ─── STATE ─────────────────────────────────────────────────────
-vault_address       = None    # the SOL-vault (pool) address you’ll paste
-monitoring_active   = False
-monitor_thread      = None
-last_inflow_time    = time.monotonic()
-processed_signatures= set()
-alert_sent          = False
-alert_chat_id       = None
-application         = None
-bot_loop            = None
+vault_address        = None   # the SOL-vault (pool) address you’ll paste
+monitoring_active    = False
+monitor_thread       = None
+last_inflow_time     = time.monotonic()
+processed_signatures = set()
+alert_sent           = False
+alert_chat_id        = None
+application          = None
+bot_loop             = None
 
 # conversation state
 VAULT_ADDRESS = 1
@@ -70,7 +70,6 @@ def monitor_loop():
             time.sleep(POLL_INTERVAL)
             continue
 
-        # fetch recent signatures for the vault address
         res = make_request("getSignaturesForAddress", [vault_address, {"limit": 10}])
         sigs = res.get("result", [])
 
@@ -79,7 +78,6 @@ def monitor_loop():
             if sig in processed_signatures:
                 continue
 
-            # fetch parsed transaction
             tx = make_request("getParsedTransaction", [sig, {"encoding":"jsonParsed"}]).get("result")
             if not tx:
                 processed_signatures.add(sig)
@@ -87,12 +85,10 @@ def monitor_loop():
 
             instrs = tx.get("transaction", {}).get("message", {}).get("instructions", [])
             for instr in instrs:
-                # only System Program "transfer" instructions
                 if instr.get("program") == "system" and "parsed" in instr:
                     parsed = instr["parsed"]
                     if parsed.get("type") == "transfer":
                         info = parsed.get("info", {})
-                        # incoming SOL to the vault
                         if info.get("destination") == vault_address:
                             lam = info.get("lamports", 0)
                             sol = lam / 1e9
@@ -104,7 +100,6 @@ def monitor_loop():
 
             processed_signatures.add(sig)
 
-        # pause alert if no large inflow in PAUSE_THRESHOLD
         now = time.monotonic()
         if now - last_inflow_time >= PAUSE_THRESHOLD and not alert_sent:
             text = (f"🚨 ALERT: No SOL inflow ≥ {SOL_THRESHOLD} SOL to {vault_address} "
@@ -140,10 +135,10 @@ async def set_vault_address(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Monitoring SOL inflows ≥{SOL_THRESHOLD} SOL to:\n{vault_address}"
     )
 
-    monitoring_active   = True
-    last_inflow_time    = time.monotonic()
-    processed_signatures= set()
-    alert_sent          = False
+    monitoring_active    = True
+    last_inflow_time     = time.monotonic()
+    processed_signatures = set()
+    alert_sent           = False
 
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
@@ -177,7 +172,19 @@ def main():
     application.add_handler(CommandHandler("stop", stop_command))
 
     print("Bot is live. Use /start to set the SOL-vault address.", flush=True)
-    application.run_polling()
+
+    # ─── ensure no webhook/getUpdates conflict ────────────────
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    loop.run_until_complete(
+        application.bot.delete_webhook(drop_pending_updates=True)
+    )
+
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
