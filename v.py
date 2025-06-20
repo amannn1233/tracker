@@ -44,7 +44,8 @@ THRESHOLD_SOL = float(os.getenv("THRESHOLD_SOL", "0.5"))
 PAUSE_THRESHOLD = int(os.getenv("PAUSE_THRESHOLD", "40"))
 POLL_SIGNATURES_INTERVAL = int(os.getenv("POLL_SIGNATURES_INTERVAL", "20"))  # seconds
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1"))
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN = "7545022673:AAHUSh--IN95PVDATCeu6a0bHYd6ymuet_Y"
+
 
 application = None
 alert_chat_id = None
