@@ -5,40 +5,24 @@ import time
 import requests
 import json
 from datetime import datetime
-
-# FastAPI and Uvicorn imports for uptime endpoint
-from fastapi import FastAPI
-import uvicorn
-
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
 )
 
-# ------------------ FASTAPI (UPTIME) SETUP ------------------
-fast_app = FastAPI()
-
-@fast_app.get("/")
-async def root():
-    return {"status": "OK"}
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(fast_app, host="0.0.0.0", port=port)
-
 # ------------------ BOT CONFIGURATION ------------------
 RPC_URL = "https://api.mainnet-beta.solana.com"
-# The token account will be provided by the user interactively.
+# The SPL token account address will be provided interactively.
 token_account = None
 
 # Threshold for an incoming token transfer (in token units)
 THRESHOLD_TOKEN = 0.5  
-# If no incoming transfer ≥ THRESHOLD_TOKEN occurs within this many seconds, trigger an alert (40 seconds)
+# If no incoming transfer ≥ THRESHOLD_TOKEN occurs within this many seconds, trigger an alert (40 sec)
 PAUSE_THRESHOLD = 40  
-# Poll the RPC every this many seconds
+# Polling interval (in seconds)
 POLL_INTERVAL = 5  
-# Replace with your Telegram bot token
+# Replace with your Telegram bot token (from BotFather)
 TELEGRAM_BOT_TOKEN = "8057780965:AAFyjn9qRdax2kOiZzBZae6VkB1bbBppiIg"
 
 # ------------------ GLOBAL VARIABLES ------------------
@@ -48,14 +32,20 @@ last_big_inflow_time = time.monotonic()
 processed_signatures = set()
 alert_sent = False
 alert_chat_id = None
+# This variable will store the human‑readable timestamp of the last qualifying inflow transaction.
+last_inflow_timestamp = None
+
 application = None
 bot_loop = None
 
-# Conversation state for receiving a token address
+# Conversation state constant for receiving token account input
 TOKEN_ADDRESS = 1
 
-# ------------------ UTILITY FUNCTIONS ------------------
+# ------------------ UTILITY FUNCTION ------------------
 def make_request(method, params):
+    """
+    Sends a JSON-RPC request to the Solana RPC.
+    """
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -70,14 +60,19 @@ def make_request(method, params):
         print("Error in make_request:", e)
         return {}
 
+# ------------------ MONITORING LOOP ------------------
 def monitor_loop():
     """
     Polls the provided token account for new transactions.
-    Resets its timer when an incoming SPL token 'transfer' to the monitored account 
-    has a human‑readable amount (uiAmount or converted from raw amount) ≥ THRESHOLD_TOKEN.
-    If no such inflow occurs within PAUSE_THRESHOLD seconds, an alert is sent.
+    For each transaction, if a parsed SPL token "transfer" instruction is detected
+    where the destination matches the monitored token account and the transfer amount,
+    when normalized (using 6 decimals), is ≥ THRESHOLD_TOKEN, then the timer is reset
+    and the block timestamp is recorded. If no qualifying inflow occurs within PAUSE_THRESHOLD
+    seconds, an alert is sent.
     """
-    global last_big_inflow_time, processed_signatures, alert_sent, monitoring_active, alert_chat_id, application, bot_loop, token_account
+    global last_big_inflow_time, processed_signatures, alert_sent, monitoring_active
+    global alert_chat_id, application, bot_loop, token_account, last_inflow_timestamp
+
     while monitoring_active:
         if token_account is None:
             time.sleep(POLL_INTERVAL)
@@ -96,33 +91,43 @@ def monitor_loop():
             if not tx:
                 continue
 
-            message = tx.get("transaction", {}).get("message", {})
-            instructions = message.get("instructions", [])
+            block_time = tx.get("blockTime")
+            instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
             for instr in instructions:
                 if instr.get("program") == "spl-token" and "parsed" in instr:
                     parsed = instr["parsed"]
                     if parsed.get("type") != "transfer":
                         continue
                     info = parsed.get("info", {})
-                    # Ensure the destination is the monitored token account.
+                    # For inflow, the destination must match the monitored token account.
                     if info.get("destination") != token_account:
                         continue
+                    # First, try to get the human-readable uiAmount.
                     token_amount = info.get("uiAmount")
                     if token_amount is None:
                         try:
-                            token_amount = float(info.get("amount", "0"))
+                            # Use the raw "amount" and convert it using the known 6 decimals.
+                            raw_amount = float(info.get("amount", "0"))
+                            token_amount = raw_amount / (10 ** 6)
                         except Exception:
                             continue
                     if float(token_amount) >= THRESHOLD_TOKEN:
                         print(f"[{datetime.utcnow().isoformat()}] Big inflow detected: {token_amount} tokens, tx: {sig}")
                         last_big_inflow_time = time.monotonic()
                         alert_sent = False
+                        # Capture block time: if available, convert it to a human‑readable format.
+                        if block_time:
+                            last_inflow_timestamp = datetime.fromtimestamp(block_time).strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            last_inflow_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             processed_signatures.add(sig)
-
+        
         now = time.monotonic()
         if now - last_big_inflow_time >= PAUSE_THRESHOLD and not alert_sent:
-            message_text = (f"🚨 ALERT: No incoming SPL token transfer ≥{THRESHOLD_TOKEN} units "
-                            f"for {int(now - last_big_inflow_time)} seconds - inflow pause detected!")
+            message_text = (
+                f"🚨 ALERT: No incoming SPL token transfer ≥ {THRESHOLD_TOKEN} units for {int(now - last_big_inflow_time)} seconds.\n"
+                f"Last inflow timestamp: {last_inflow_timestamp if last_inflow_timestamp else 'N/A'}"
+            )
             if alert_chat_id is not None and bot_loop is not None:
                 future = asyncio.run_coroutine_threadsafe(
                     application.bot.send_message(chat_id=alert_chat_id, text=message_text),
@@ -134,7 +139,7 @@ def monitor_loop():
                     print("Error sending alert:", exc)
                 print(message_text)
             alert_sent = True
-
+        
         time.sleep(POLL_INTERVAL)
 
 # ------------------ TELEGRAM BOT HANDLERS ------------------
@@ -143,7 +148,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return TOKEN_ADDRESS
 
 async def set_token_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    global token_account, monitoring_active, monitor_thread, last_big_inflow_time, processed_signatures, alert_chat_id, alert_sent, bot_loop
+    global token_account, monitoring_active, monitor_thread, last_big_inflow_time
+    global processed_signatures, alert_chat_id, alert_sent, bot_loop
     token_account = update.message.text.strip()
     if not token_account:
         await update.message.reply_text("Invalid token address. Please try /start again.")
@@ -169,15 +175,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ------------------ MAIN FUNCTION ------------------
+# ------------------ MAIN FUNCTION (Updated as Provided) ------------------
 def main():
     global application
-    # Start the FastAPI web server to provide an uptime endpoint.
-    web_thread = threading.Thread(target=run_web_server, daemon=True)
-    web_thread.start()
-
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
+    
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
@@ -187,8 +189,12 @@ def main():
     )
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("stop", stop_command))
-
+    
     print("Telegram bot started. Use /start to begin and /stop to stop monitoring.")
+    
+    # Delete any existing webhook before starting polling to avoid conflicts.
+    application.bot.delete_webhook(drop_pending_updates=True)
+    
     application.run_polling()
 
 if __name__ == "__main__":
