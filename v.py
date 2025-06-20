@@ -9,7 +9,7 @@ try:
     import websockets
     USE_WEBSOCKETS = True
 except ImportError:
-    USE_WEBSOCKETS = False
+    USE_WEBSOCKSETS = False
 
 from fastapi import FastAPI
 import uvicorn
@@ -22,6 +22,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# ------------------ FASTAPI (UPTIME) SETUP ------------------
 fast_app = FastAPI()
 
 @fast_app.get("/")
@@ -41,14 +42,17 @@ POSSIBLE_WALLETS = [
 ]
 THRESHOLD_SOL = float(os.getenv("THRESHOLD_SOL", "0.5"))
 PAUSE_THRESHOLD = int(os.getenv("PAUSE_THRESHOLD", "40"))
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7545022673:AAHUSh--IN95PVDATCeu6a0bHYd6ymuet_Y")
+POLL_SIGNATURES_INTERVAL = int(os.getenv("POLL_SIGNATURES_INTERVAL", "20"))  # seconds
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 application = None
 alert_chat_id = None
 monitor_task = None
 monitor_pubkey = None
 last_big_outflow_time = None
-alert_sent = False
+last_alert_time = None
+processed_sigs = set()
 
 async def send_message(text: str):
     global alert_chat_id, application
@@ -71,23 +75,70 @@ async def fetch_parsed_transaction(sig: str):
     except Exception:
         return None
 
-async def check_elapsed_loop(pubkey: str):
-    global last_big_outflow_time, alert_sent
+async def poll_signatures(pubkey: str):
+    global last_big_outflow_time, last_alert_time, processed_sigs
     while True:
-        await asyncio.sleep(PAUSE_THRESHOLD)
-        elapsed = time.monotonic() - last_big_outflow_time
-        if elapsed >= PAUSE_THRESHOLD:
-            await send_message(f"🚨 ALERT: Wallet {pubkey} had no outgoing transfer ≥{THRESHOLD_SOL} SOL for {int(elapsed)} seconds.")
-            alert_sent = True
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [pubkey, {"limit": 1000}]
+            }
+            r = requests.post(RPC_HTTP_URL, json=payload, timeout=10).json()
+            sigs = r.get("result", [])
+            for entry in sigs:
+                sig = entry.get("signature")
+                if not sig or sig in processed_sigs:
+                    continue
+                processed_sigs.add(sig)
+                tx = await fetch_parsed_transaction(sig)
+                if not tx:
+                    continue
+                # process all instructions
+                instrs = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+                await _process_instructions(instrs, pubkey)
+                for inner in tx.get("meta", {}).get("innerInstructions", []):
+                    await _process_instructions(inner.get("instructions", []), pubkey)
+        except Exception as e:
+            await send_message(f"\u26a0\ufe0f Polling error for {pubkey}: {e}")
+        await asyncio.sleep(POLL_SIGNATURES_INTERVAL)
+
+async def _process_instructions(instructions, pubkey: str):
+    global last_big_outflow_time, last_alert_time
+    for instr in instructions:
+        if instr.get("program") == "system" and instr.get("parsed", {}).get("type") == "transfer":
+            info = instr.get("parsed", {}).get("info", {})
+            if info.get("source") == pubkey:
+                lamports = int(info.get("lamports", 0) or 0)
+                sol = lamports / 1e9
+                if sol >= THRESHOLD_SOL:
+                    now = time.monotonic()
+                    last_big_outflow_time = now
+                    last_alert_time = now
+                    await send_message(f"\u2705 Transfer found from {pubkey}: {sol:.4f} SOL. Monitoring continues...")
+
+async def check_elapsed_loop(pubkey: str):
+    global last_big_outflow_time, last_alert_time
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        if last_big_outflow_time is None:
+            continue
+        now = time.monotonic()
+        # if threshold passed since last transfer and since last alert
+        if now - last_big_outflow_time >= PAUSE_THRESHOLD and now - last_alert_time >= PAUSE_THRESHOLD:
+            elapsed = int(now - last_big_outflow_time)
+            await send_message(f"\ud83d\udea8 ALERT: Wallet {pubkey} had no outgoing transfer \u2265{THRESHOLD_SOL} SOL for {elapsed} seconds.")
+            last_alert_time = now
 
 async def subscribe_account_ws(pubkey: str):
-    global last_big_outflow_time, alert_sent
+    global last_big_outflow_time, last_alert_time, processed_sigs
     last_big_outflow_time = time.monotonic()
-    alert_sent = False
-
-    await send_message(f"🔍 Monitoring started for {pubkey}. Watching for transfers ≥{THRESHOLD_SOL} SOL...")
+    last_alert_time = last_big_outflow_time
+    processed_sigs.clear()
+    await send_message(f"\ud83d\udd0d Monitoring started for {pubkey}. Watching for transfers \u2265{THRESHOLD_SOL} SOL...")
     asyncio.create_task(check_elapsed_loop(pubkey))
-
+    asyncio.create_task(poll_signatures(pubkey))
     try:
         async with websockets.connect(RPC_WS_URL) as ws:
             req = {
@@ -101,35 +152,24 @@ async def subscribe_account_ws(pubkey: str):
             async for message in ws:
                 msg = json.loads(message)
                 sig = msg.get("params", {}).get("result", {}).get("signature")
-                if not sig:
-                    continue
-                tx = await fetch_parsed_transaction(sig)
-                if not tx:
-                    continue
-                instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
-                for instr in instructions:
-                    if instr.get("program") == "system" and instr.get("parsed", {}).get("type") == "transfer":
-                        info = instr.get("parsed", {}).get("info", {})
-                        if info.get("source") == pubkey:
-                            lamports = int(info.get("lamports", 0))
-                            sol = lamports / 1e9
-                            if sol >= THRESHOLD_SOL:
-                                last_big_outflow_time = time.monotonic()
-                                alert_sent = False
-                                await send_message(f"✅ Transfer found from {pubkey}: {sol:.4f} SOL. Monitoring continues...")
+                if sig and sig not in processed_sigs:
+                    processed_sigs.add(sig)
+                    tx = await fetch_parsed_transaction(sig)
+                    if tx:
+                        instrs = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+                        await _process_instructions(instrs, pubkey)
+                        for inner in tx.get("meta", {}).get("innerInstructions", []):
+                            await _process_instructions(inner.get("instructions", []), pubkey)
     except Exception as e:
-        await send_message(f"⚠️ Subscription error for {pubkey}: {e}. Restarting monitor.")
+        await send_message(f"\u26a0\ufe0f Subscription error for {pubkey}: {e}. Restarting monitor.")
         await asyncio.sleep(5)
-        if monitor_task and not monitor_task.cancelled():
-            asyncio.create_task(subscribe_account(pubkey))
+        asyncio.create_task(subscribe_account(pubkey))
 
 async def subscribe_account(pubkey: str):
-    global monitor_pubkey
-    monitor_pubkey = pubkey
     if USE_WEBSOCKETS:
         await subscribe_account_ws(pubkey)
     else:
-        await send_message("❌ websockets module not installed. Install it or switch to a method that supports polling.")
+        await send_message("\u274c websockets module not installed. Cannot monitor in real time.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not POSSIBLE_WALLETS:
@@ -140,23 +180,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Select wallet to monitor:", reply_markup=reply)
 
 async def wallet_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global alert_chat_id, monitor_task, last_big_outflow_time, alert_sent
+    global alert_chat_id, monitor_task
     query = update.callback_query
     await query.answer()
     pubkey = query.data
     alert_chat_id = query.message.chat.id
-    last_big_outflow_time = time.monotonic()
-    alert_sent = False
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
     monitor_task = asyncio.create_task(subscribe_account(pubkey))
-    await query.edit_message_text(f"🟢 Now monitoring wallet:\n{pubkey}")
+    await query.edit_message_text(f"🔵 Now monitoring wallet:\n{pubkey}")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitor_task
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
     await update.message.reply_text("🛑 Monitoring stopped.")
+
 
 def main():
     global application
