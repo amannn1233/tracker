@@ -53,7 +53,6 @@ alert_chat_id         = None
 monitor_task          = None
 previous_balance      = None
 last_big_outflow_time = None
-last_transfer_msg_time = 0
 alert_sent            = False
 monitor_pubkey        = None
 
@@ -69,12 +68,11 @@ async def fetch_balance(pubkey: str) -> int:
 
 # ------------------ MONITOR FUNCTIONS ------------------
 async def subscribe_account_ws(pubkey: str):
-    global previous_balance, last_big_outflow_time, alert_sent, last_transfer_msg_time
+    global previous_balance, last_big_outflow_time, alert_sent
     prev = await fetch_balance(pubkey)
     previous_balance = prev
     last_big_outflow_time = time.monotonic()
     alert_sent = False
-    last_transfer_msg_time = 0
     try:
         async with websockets.connect(RPC_WS_URL) as ws:
             req = {
@@ -104,15 +102,11 @@ async def subscribe_account_ws(pubkey: str):
                 if diff < 0:
                     sol_out = -diff / 1e9
                     if sol_out >= THRESHOLD_SOL:
-                        now = time.monotonic()
-                        last_big_outflow_time = now
+                        last_big_outflow_time = time.monotonic()
                         alert_sent = False
-                        # Changed from 10 seconds to 7 seconds threshold
-                        if now - last_transfer_msg_time > 7:
-                            last_transfer_msg_time = now
-                            if alert_chat_id and application:
-                                text = f"[{datetime.utcnow().isoformat()}] {sol_out:.4f} SOL outflow detected from {pubkey}."
-                                asyncio.create_task(application.bot.send_message(chat_id=alert_chat_id, text=text))
+                        if alert_chat_id and application:
+                            text = f"[{datetime.utcnow().isoformat()}] {sol_out:.4f} SOL outflow detected from {pubkey}."
+                            asyncio.create_task(application.bot.send_message(chat_id=alert_chat_id, text=text))
                 previous_balance = new_balance
                 elapsed = time.monotonic() - last_big_outflow_time
                 if elapsed >= PAUSE_THRESHOLD and not alert_sent:
@@ -182,7 +176,7 @@ async def wallet_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
     monitor_task = asyncio.create_task(subscribe_account(pubkey))
-    await query.edit_message_text(f"🔵 Now monitoring wallet:\n{pubkey}")
+    await query.edit_message_text(f"🟢 Now monitoring wallet:\n{pubkey}")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitor_task
@@ -191,6 +185,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Monitoring stopped.")
 
 # ------------------ MAIN ------------------
+
 def main():
     global application
     import threading
